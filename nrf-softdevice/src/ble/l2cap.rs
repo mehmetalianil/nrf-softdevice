@@ -14,17 +14,41 @@ use crate::{RawError, Softdevice};
 pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
     let l2cap_evt = get_union_field(ble_evt, &(*ble_evt).evt.l2cap_evt);
     match (*ble_evt).header.evt_id as u32 {
-        raw::BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_CREDIT => {}
+        raw::BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_CREDIT => {
+            info!("BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_CREDIT")
+        }
         raw::BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_SDU_BUF_RELEASED => {
             let params = &l2cap_evt.params.ch_sdu_buf_released;
             let pkt = unwrap!(NonNull::new(params.sdu_buf.p_data));
+
+            info!(
+                "BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_SDU_BUF_RELEASED {=usize:x}",
+                params.sdu_buf.p_data as _
+            );
+
             (unwrap!(PACKET_FREE))(pkt)
         }
         raw::BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_TX => {
             let params = &l2cap_evt.params.tx;
             let pkt = unwrap!(NonNull::new(params.sdu_buf.p_data));
+
+            info!(
+                "BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_TX {=usize:x}",
+                params.sdu_buf.p_data as _
+            );
+
             portal(l2cap_evt.conn_handle).call(ble_evt);
             (unwrap!(PACKET_FREE))(pkt)
+        }
+        raw::BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_RX => {
+            let params = &l2cap_evt.params.rx;
+
+            info!(
+                "BLE_L2CAP_EVTS_BLE_L2CAP_EVT_CH_RX {=usize:x}",
+                params.sdu_buf.p_data as _
+            );
+
+            portal(l2cap_evt.conn_handle).call(ble_evt);
         }
         _ => {
             portal(l2cap_evt.conn_handle).call(ble_evt);
@@ -76,6 +100,7 @@ impl From<RawError> for RxError {
 pub enum SetupError {
     Disconnected,
     Refused,
+    AllocateFailed,
     Raw(RawError),
 }
 
@@ -141,6 +166,21 @@ impl<P: Packet> L2cap<P> {
         let sd = unsafe { Softdevice::steal() };
 
         let conn_handle = conn.with_state(|state| state.check_connected())?;
+
+        let ret = unsafe {
+            raw::sd_ble_l2cap_ch_flow_control(
+                conn_handle,
+                raw::BLE_L2CAP_CID_INVALID as _,
+                0xFFFF,
+                ptr::null_mut(),
+            )
+        };
+        if let Err(err) = RawError::convert(ret) {
+            warn!("sd_ble_l2cap_ch_flow_control err {:?}", err);
+            return Err(err.into());
+        }
+
+        let ptr = P::allocate().ok_or(SetupError::AllocateFailed)?;
         let mut cid: u16 = raw::BLE_L2CAP_CID_INVALID as _;
         let params = raw::ble_l2cap_ch_setup_params_t {
             le_psm: psm,
@@ -149,8 +189,8 @@ impl<P: Packet> L2cap<P> {
                 rx_mps: sd.l2cap_rx_mps,
                 rx_mtu: P::MTU as u16,
                 sdu_buf: raw::ble_data_t {
-                    len: 0,
-                    p_data: ptr::null_mut(),
+                    p_data: ptr.as_ptr(),
+                    len: P::MTU as u16,
                 },
             },
         };
@@ -171,19 +211,21 @@ impl<P: Packet> L2cap<P> {
                         let l2cap_evt = get_union_field(ble_evt, &(*ble_evt).evt.l2cap_evt);
                         let _evt = &l2cap_evt.params.ch_setup;
 
-                        // default is 1
-                        if config.credits != 1 {
-                            let ret = raw::sd_ble_l2cap_ch_flow_control(
-                                conn_handle,
-                                cid,
-                                config.credits,
-                                ptr::null_mut(),
-                            );
-                            if let Err(err) = RawError::convert(ret) {
-                                warn!("sd_ble_l2cap_ch_flow_control err {:?}", err);
-                                return Err(err.into());
-                            }
+                        let mut credits_out = 0;
+                        let ret = raw::sd_ble_l2cap_ch_flow_control(
+                            conn_handle,
+                            cid,
+                            0,
+                            &mut credits_out,
+                        );
+                        if let Err(err) = RawError::convert(ret) {
+                            warn!("sd_ble_l2cap_ch_flow_control err {:?}", err);
+                            return Err(err.into());
                         }
+                        info!(
+                            "sd_ble_l2cap_ch_flow_control credits_out ={=u16:x}",
+                            credits_out
+                        );
 
                         Ok(Channel {
                             conn: conn.clone(),
@@ -332,6 +374,11 @@ impl<P: Packet> Channel<P> {
             len: len as u16,
         };
 
+        info!(
+            "sd_ble_l2cap_ch_tx {=usize:x} {=usize:x}",
+            ptr.as_ptr() as _,
+            len
+        );
         let ret = unsafe { raw::sd_ble_l2cap_ch_tx(conn_handle, self.cid, &data) };
         match RawError::convert(ret) {
             Err(RawError::Resources) => {
@@ -385,6 +432,7 @@ impl<P: Packet> Channel<P> {
             len: P::MTU as u16,
         };
 
+        info!("sd_ble_l2cap_ch_rx {=usize:x}", ptr.as_ptr() as _);
         let ret = unsafe { raw::sd_ble_l2cap_ch_rx(conn_handle, self.cid, &data) };
         if let Err(err) = RawError::convert(ret) {
             warn!("sd_ble_l2cap_ch_rx err {:?}", err);
